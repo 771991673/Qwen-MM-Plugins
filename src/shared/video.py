@@ -184,7 +184,7 @@ def compute_dynamic_fps(
     nframes = int(duration * default_fps)
     nframes = max(min_frames, min(max_frames, nframes))
     if duration > 0 and native_fps > 0:
-        nframes = min(nframes, max(1, math.ceil(duration * native_fps)))
+        nframes = min(nframes, math.ceil(duration * native_fps))
 
     fps = nframes / duration if duration > 0 else default_fps
     return fps, nframes

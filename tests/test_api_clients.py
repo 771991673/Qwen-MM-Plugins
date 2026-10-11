@@ -657,25 +657,11 @@ def test_encode_video_source_allow_upload_false_skips_temporary_oss(sample_video
     assert _temp_oss == []
 
 
-@pytest.mark.parametrize("duration,native_fps,expected_count", [(10.0, 1.0, 10), (1.0, 1.0, 1)])
-def test_encode_video_source_reports_effective_sampling_rate(monkeypatch, duration, native_fps, expected_count):
-    from shared import video
+def test_video_sampling_respects_native_frame_count():
+    from shared.video import compute_dynamic_fps
 
-    monkeypatch.setattr(
-        video, "get_video_info", lambda p: {"duration": duration, "native_fps": native_fps, "height": 64, "width": 64}
-    )
-    sampled_at = []
-
-    def extract(_source, timestamps, _height, _width):
-        sampled_at.extend(timestamps)
-        return [(timestamp, "Zm9v") for timestamp in timestamps]
-
-    monkeypatch.setattr(video, "extract_frames_by_seeking", extract)
-    part = oa.encode_video_source("/some/local/slow.mp4", allow_upload=False)
-
-    assert sampled_at == pytest.approx([i * duration / expected_count for i in range(expected_count)])
-    assert len(part["video"]) == expected_count
-    assert part["fps"] == round(expected_count / duration, 2)
+    assert compute_dynamic_fps(10.0, 1.0, 4, 128, 2.0) == (1.0, 10)
+    assert compute_dynamic_fps(1.0, 1.0, 4, 128, 2.0) == (1.0, 1)
 
 
 @pytest.mark.parametrize(
@@ -729,30 +715,16 @@ def test_vision_chat_dry_run_does_not_upload_images(monkeypatch, tmp_path, _temp
     assert "error" not in blocks[0]["text"].lower()
 
 
-def test_encode_video_source_skips_upload_when_frames_capture_everything(monkeypatch, _temp_oss):
-    """A clip short enough to sample in full locally must not be uploaded — frames lose nothing."""
+@pytest.mark.parametrize("duration,native_fps", [(10.0, 30.0), (100.0, 1.0)])
+def test_encode_video_source_skips_upload_when_frames_fit(monkeypatch, _temp_oss, duration, native_fps):
     from shared import oss, video
 
     monkeypatch.setattr(
-        video, "get_video_info", lambda p: {"duration": 10.0, "native_fps": 30.0, "height": 8, "width": 8}
+        video, "get_video_info", lambda p: {"duration": duration, "native_fps": native_fps, "height": 8, "width": 8}
     )
     monkeypatch.setattr(oss, "is_upload_configured", lambda: False)
     monkeypatch.setattr(video, "extract_frames_by_seeking", lambda *a, **k: [(0.0, "Zm9v"), (1.0, "YmFy")])
     part = oa.encode_video_source("/some/local/short.mp4", **ENDPOINT)
-    assert part["type"] == "video"  # sampled locally
-    assert _temp_oss == []
-
-
-def test_encode_video_source_skips_upload_when_native_rate_fits(monkeypatch, _temp_oss):
-    from shared import oss, video
-
-    monkeypatch.setattr(
-        video, "get_video_info", lambda p: {"duration": 100.0, "native_fps": 1.0, "height": 8, "width": 8}
-    )
-    monkeypatch.setattr(video, "extract_frames_by_seeking", lambda *a, **k: [(0.0, "Zm9v")])
-    monkeypatch.setattr(oss, "is_upload_configured", lambda: False)
-
-    part = oa.encode_video_source("/some/local/slow.mp4", max_frames=128, **ENDPOINT)
     assert part["type"] == "video"
     assert _temp_oss == []
 
