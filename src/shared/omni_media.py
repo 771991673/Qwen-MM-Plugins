@@ -19,6 +19,7 @@ import os
 import subprocess
 import tempfile
 from collections.abc import Callable
+from functools import partial
 
 from shared import oss
 from shared.api_omni import (
@@ -34,7 +35,7 @@ from shared.api_omni import (
     omni_frames_part,
     omni_video_part,
 )
-from shared.env import get_env
+from shared.env import ConfigurationError, get_env
 from shared.syscmd import find_tool
 
 log = logging.getLogger(__name__)
@@ -77,6 +78,8 @@ def media_duration(path: str) -> float:
 
     try:
         return float(probe_media(path).get("format", {}).get("duration") or 0.0)
+    except ConfigurationError:
+        raise
     except Exception:  # noqa: BLE001 — callers treat an unreadable duration as unknown
         return 0.0
 
@@ -87,8 +90,25 @@ def has_audio_stream(path: str) -> bool:
 
     try:
         return any(stream.get("codec_type") == "audio" for stream in probe_media(path).get("streams", []))
+    except ConfigurationError:
+        raise
     except Exception:  # noqa: BLE001 — an unprobeable source has no extractable track
         return False
+
+
+def video_time_base(path: str) -> str | None:
+    """Time base of the first video stream (e.g. ``1/15360``), or None when it cannot be read."""
+    from shared.video import probe_media
+
+    try:
+        streams = probe_media(path).get("streams", [])
+    except ConfigurationError:
+        raise
+    except Exception:  # noqa: BLE001 — callers fall back to ffmpeg's default time base
+        return None
+    time_base = next((str(s.get("time_base") or "") for s in streams if s.get("codec_type") == "video"), "")
+    num, _, den = time_base.partition("/")
+    return time_base if num.isdigit() and den.isdigit() and int(num) > 0 and int(den) > 0 else None
 
 
 def _range_args(start_time: float, duration: float | None) -> list[str]:
@@ -274,12 +294,27 @@ def encode_video(
     video_kbps: float | None,
     start_time: float = 0.0,
     duration: float | None = None,
+    preserve_timestamps: bool = False,
 ) -> None:
-    """Transcode a whole video or time range for Omni sampling."""
+    """Transcode media, optionally preserving frame PTS and audio offsets.
+
+    In preservation mode, ``fps`` is only a downstream API sampling hint; local encoding keeps
+    the source frame cadence. Selected ranges share one rebased audio/video timeline.
+    """
     cmd = [find_tool("ffmpeg"), "-v", "error", "-y"]
     if start_time > 0:
-        cmd += ["-ss", f"{start_time:.3f}"]
-    cmd += ["-i", file_path, *_range_args(0.0, duration)]
+        cmd += ["-ss", f"{start_time:.6f}" if preserve_timestamps else f"{start_time:.3f}"]
+    cmd += ["-i", file_path]
+    if preserve_timestamps:
+        # Input seeking rebases the common media timeline while retaining stream offsets.
+        # Limit the whole-file path too: audio codec padding must not extend the source.
+        if duration is None:
+            remaining = media_duration(file_path) - start_time
+            duration = remaining if remaining > 0 else None
+        if duration is not None:
+            cmd += ["-t", f"{duration:.6f}"]
+    else:
+        cmd += _range_args(0.0, duration)
     cmd += [
         "-map",
         "0:v:0",
@@ -296,7 +331,18 @@ def encode_video(
         "-crf",
         str(VIDEO_CRF),
     ]
-    if fps:
+    if preserve_timestamps:
+        # Output -r duplicates/drops frames and rounds the tail to the output frame period.
+        # Keep decoded PTS (including VFR); the API's content-part fps handles sampling.
+        cmd += ["-fps_mode:v", "passthrough", "-bf", "0"]
+        # Encode in the source time base. Pass it explicitly: ffmpeg 6 spells this
+        # "-enc_time_base -1", ffmpeg 7 adds "demux", and ffmpeg 8+ rejects "-1".
+        if time_base := video_time_base(file_path):
+            cmd += ["-enc_time_base:v", time_base]
+        # Retain leading silence rather than moving delayed audio to zero. Do not use
+        # infinite apad here: together with sparse VFR video it can stall ffmpeg.
+        cmd += ["-af", _audio_timeline_filter(None)]
+    elif fps:
         cmd += ["-r", f"{fps:g}"]
     if video_kbps:
         kbps = max(1, int(video_kbps))
@@ -329,8 +375,9 @@ def preprocess_video(
     max_bytes: int = OMNI_MAX_UPLOAD_BYTES,
     start_time: float = 0.0,
     duration: float | None = None,
+    preserve_timestamps: bool = False,
 ) -> None:
-    """Fit a whole video or bounded time range into the inline upload budget."""
+    """Fit a video into the inline budget; the API opts into preserving source timestamps."""
     from shared.env import TOKEN_SIZE
     from shared.image import smart_resize
     from shared.video import get_video_info
@@ -354,6 +401,7 @@ def preprocess_video(
             video_kbps=video_kbps,
             start_time=start_time,
             duration=duration,
+            preserve_timestamps=preserve_timestamps,
         )
         size = os.path.getsize(out_path)
         if size <= max_bytes:
@@ -389,6 +437,7 @@ def transcode_and_upload(
     *,
     start_time: float = 0.0,
     duration: float | None = None,
+    preserve_timestamps: bool = False,
 ) -> str:
     """Transcode a whole video or time range without a byte cap, then upload it to OSS."""
     from shared.env import TOKEN_SIZE
@@ -407,8 +456,9 @@ def transcode_and_upload(
         video_kbps=None,
         start_time=start_time,
         duration=duration,
+        preserve_timestamps=preserve_timestamps,
     )
-    return oss.upload_and_sign(out_path, key_prefix=get_env("OSS_VIDEO_CLIP_PREFIX", "tmp/video_clips"))
+    return oss.upload_and_sign(out_path, key_prefix=get_env("OSS_VIDEO_CLIP_PREFIX"))
 
 
 def fit_frames(
@@ -581,6 +631,8 @@ def local_video_parts(
                     start_time=start_time,
                     duration=duration,
                 )
+            except ConfigurationError:
+                raise
             except Exception as upload_error:  # noqa: BLE001 — frames remain a local fallback
                 log.warning("OSS upload failed (%s); falling back to frames + audio", upload_error)
             else:
@@ -593,6 +645,8 @@ def local_video_parts(
             start_time=start_time,
             duration=duration,
         )
+    except ConfigurationError:
+        raise
     except Exception as error:  # noqa: BLE001 — preserve the existing small-file fallback
         log.warning("video preprocess failed (%s)", error)
         if start_time > 0 or duration is not None or os.path.getsize(file_path) > max_upload_bytes:
@@ -625,6 +679,8 @@ def audio_format_for(path: str) -> str | None:
         for stream in probe_media(path).get("streams", []):
             if stream.get("codec_type") == "audio":
                 return _AUDIO_CODEC_FORMATS.get(str(stream.get("codec_name", "")).lower())
+    except ConfigurationError:
+        raise
     except Exception:  # noqa: BLE001 — unprobeable: the caller falls back to local delivery
         return None
     return None
@@ -681,6 +737,8 @@ def temporary_oss_parts(
             api_key=api_key,
             model=model,
         )
+    except ConfigurationError:
+        raise
     except Exception as upload_error:  # noqa: BLE001 — preserve the local fallback chain
         log.warning("DashScope temporary OSS upload failed (%s); falling back to local delivery", upload_error)
         return None
@@ -703,6 +761,7 @@ def build_media_parts(
     start_time: float = 0.0,
     duration: float | None = None,
     max_upload_bytes: int = OMNI_MAX_UPLOAD_BYTES,
+    preserve_timestamps: bool = False,
 ) -> list[dict]:
     """Build Omni content parts using the shared local-file delivery policy."""
     if is_omni_url(file_path):
@@ -738,6 +797,14 @@ def build_media_parts(
                 duration=duration,
             )
         ]
+    delivery_hooks = (
+        {
+            "preprocess_video_fn": partial(preprocess_video, preserve_timestamps=True),
+            "transcode_and_upload_fn": partial(transcode_and_upload, preserve_timestamps=True),
+        }
+        if preserve_timestamps
+        else {}
+    )
     return local_video_parts(
         file_path,
         fps,
@@ -748,4 +815,5 @@ def build_media_parts(
         start_time=start_time,
         duration=duration,
         max_upload_bytes=max_upload_bytes,
+        **delivery_hooks,
     )

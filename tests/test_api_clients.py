@@ -8,6 +8,7 @@ module's attribute is enough, no live network.
 
 import base64
 import io
+import json
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,6 +20,7 @@ import shared.api_dashscope as dsc
 import shared.api_omni as omni
 import shared.api_openai as oa
 import shared.retry as sr
+from shared.env import DEFAULT_DASHSCOPE_BASE_URL, DEFAULT_OMNI_MODEL
 
 
 @pytest.mark.parametrize("mode", ["RGB", "RGBA"])
@@ -110,18 +112,17 @@ def test_poll_returns_synthetic_timeout():
 # ── api_openai.call_openai_chat ──────────────────────────────────────
 
 
-def test_model_resolvers_use_explicit_env_then_builtin(monkeypatch):
-    values = {}
-    monkeypatch.setattr(oa, "get_env", values.get)
-    monkeypatch.setattr(omni, "get_env", values.get)
+def test_model_resolvers_use_explicit_env_then_builtin(monkeypatch, empty_user_config):
+    monkeypatch.delenv("QWEN_MM_API_VL_MODEL", raising=False)
+    monkeypatch.delenv("QWEN_MM_API_OMNI_MODEL", raising=False)
     assert oa.resolve_vl_model() == oa.DEFAULT_MODEL
-    assert omni.resolve_omni_model() == omni.DEFAULT_OMNI_MODEL
+    assert omni.resolve_omni_model() == DEFAULT_OMNI_MODEL
 
-    values["QWEN_MM_API_VL_MODEL"] = "env-vl"
+    monkeypatch.setenv("QWEN_MM_API_VL_MODEL", "env-vl")
     assert oa.resolve_vl_model() == "env-vl"
-    assert omni.resolve_omni_model() == omni.DEFAULT_OMNI_MODEL
+    assert omni.resolve_omni_model() == DEFAULT_OMNI_MODEL
 
-    values["QWEN_MM_API_OMNI_MODEL"] = "env-omni"
+    monkeypatch.setenv("QWEN_MM_API_OMNI_MODEL", "env-omni")
     assert oa.resolve_vl_model() == "env-vl"
     assert omni.resolve_omni_model() == "env-omni"
     assert oa.resolve_vl_model("explicit-vl") == "explicit-vl"
@@ -149,18 +150,22 @@ def test_model_resolvers_use_explicit_env_then_builtin(monkeypatch):
         ("http://localhost:8000/v1", None, "custom", "custom"),
     ],
 )
-def test_endpoint_selects_key_by_host(monkeypatch, base_url, missing_key, explicit_key, expected_key):
+def test_endpoint_selects_key_by_host(
+    monkeypatch, empty_user_config, base_url, missing_key, explicit_key, expected_key
+):
     values = {
         "DASHSCOPE_API_KEY": "dashscope",
         "ORCAROUTER_API_KEY": "orca",
         "OPENROUTER_API_KEY": "openrouter",
         "CHEAPER_INFERENCE_API_KEY": "cheaperinference",
     }
+    monkeypatch.delenv("DASHSCOPE_BASE_URL", raising=False)
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
     if missing_key:
-        del values[missing_key]
-    monkeypatch.setattr(oa, "get_env", values.get)
+        monkeypatch.delenv(missing_key)
     arguments = {"base_url": base_url, "api_key": explicit_key}
-    expected = (base_url or oa.DEFAULT_DASHSCOPE_BASE_URL, expected_key)
+    expected = (base_url or DEFAULT_DASHSCOPE_BASE_URL, expected_key)
     assert oa.resolve_openai_endpoint(arguments) == expected
     assert omni.resolve_omni_endpoint(arguments) == expected
 
@@ -185,7 +190,6 @@ def test_dashscope_key_follows_the_configured_origin(monkeypatch, configured, ba
 
 
 def test_openrouter_endpoint_from_config(monkeypatch, tmp_path):
-    import shared.env as env
 
     config = tmp_path / "config"
     config.write_text(
@@ -197,12 +201,11 @@ def test_openrouter_endpoint_from_config(monkeypatch, tmp_path):
     monkeypatch.setenv("QWEN_MM_CONFIG", str(config))
     for key in ("DASHSCOPE_BASE_URL", "OPENROUTER_API_KEY", "DASHSCOPE_API_KEY"):
         monkeypatch.delenv(key, raising=False)
-    monkeypatch.setattr(env, "_config_cache", None)
 
     for resolve in (oa.resolve_openai_endpoint, omni.resolve_omni_endpoint):
         assert resolve({}) == ("https://openrouter.ai/api/v1", "config-openrouter")
-        assert resolve({"base_url": oa.DEFAULT_DASHSCOPE_BASE_URL}) == (
-            oa.DEFAULT_DASHSCOPE_BASE_URL,
+        assert resolve({"base_url": DEFAULT_DASHSCOPE_BASE_URL}) == (
+            DEFAULT_DASHSCOPE_BASE_URL,
             "config-dashscope",
         )
 
@@ -246,7 +249,7 @@ def _install_fake_openai(monkeypatch, behavior):
     [
         "https://openrouter.ai/api/v1",
         "http://localhost:8000/v1",
-        oa.DEFAULT_DASHSCOPE_BASE_URL,
+        DEFAULT_DASHSCOPE_BASE_URL,
         "https://api.orcarouter.ai/v1",
     ],
 )
@@ -296,11 +299,73 @@ def test_call_omni_enables_temporary_oss_resolution(monkeypatch):
         }
     ]
 
-    text, _ = omni.call_omni(base_url=oa.DEFAULT_DASHSCOPE_BASE_URL, api_key="key", messages=messages)
+    text, _ = omni.call_omni(base_url=DEFAULT_DASHSCOPE_BASE_URL, api_key="key", messages=messages)
 
     assert text == "ok"
     sent = holder["client"].chat.completions.seen[0]
     assert sent["extra_headers"] == {"X-DashScope-OssResourceResolve": "enable"}
+
+
+@pytest.mark.parametrize("json_output", [False, True])
+def test_omni_http_requests_use_provider_generation_defaults(monkeypatch, json_output):
+    import openai
+
+    payloads = []
+    responses = iter(["invalid JSON", '{"ok": true}'] if json_output else ["answer"])
+
+    def respond(request):
+        payloads.append(json.loads(request.content))
+        chunk = {"choices": [{"index": 0, "delta": {"content": next(responses)}}]}
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n",
+        )
+
+    client_type = openai.OpenAI
+    monkeypatch.setattr(
+        openai,
+        "OpenAI",
+        lambda **kwargs: client_type(**kwargs, http_client=httpx.Client(transport=httpx.MockTransport(respond))),
+    )
+    call = omni.call_omni_json if json_output else omni.call_omni
+    result = call(base_url="http://local/v1", api_key="test-key", model="test-omni", messages=[])
+    if json_output:
+        assert result == {"ok": True}
+    else:
+        assert result[0] == "answer"
+    assert len(payloads) == (2 if json_output else 1)
+    for payload in payloads:
+        assert "max_tokens" not in payload and "temperature" not in payload
+        assert payload["model"] == "test-omni"
+        assert payload["stream"] is True and payload["modalities"] == ["text"]
+
+
+@pytest.mark.parametrize(
+    "settings", [{"max_tokens": 4096}, {"temperature": 0.0}, {"max_tokens": 4096, "temperature": 0.01}]
+)
+def test_omni_explicit_generation_settings_still_work_for_other_callers(monkeypatch, settings):
+    chunk = SimpleNamespace(usage=None, choices=[SimpleNamespace(delta=SimpleNamespace(content="ok"))])
+    holder = _install_fake_openai(monkeypatch, lambda _: [chunk])
+    omni.call_omni(base_url="http://local/v1", api_key="test-key", messages=[], **settings)
+    sent = holder["client"].chat.completions.seen[0]
+    assert {key: sent[key] for key in ("max_tokens", "temperature") if key in sent} == settings
+
+
+def test_omni_json_preserves_explicit_settings_and_repair_behavior(monkeypatch):
+    calls = []
+    responses = iter(["invalid JSON", '{"ok": true}'])
+
+    def fake_call(**kwargs):
+        calls.append(kwargs)
+        return next(responses), None
+
+    monkeypatch.setattr(omni, "call_omni", fake_call)
+    assert omni.call_omni_json(
+        base_url="http://local/v1", api_key="key", messages=[], max_tokens=4096, temperature=0.01
+    ) == {"ok": True}
+    assert calls[0]["temperature"] == 0.01 and calls[1]["temperature"] == 0.0
+    assert all(call["max_tokens"] == 4096 for call in calls)
 
 
 def test_call_openai_chat_retries_transient_then_succeeds(monkeypatch):
@@ -568,7 +633,7 @@ def _temp_oss(monkeypatch):
     return uploaded
 
 
-ENDPOINT = {"base_url": oa.DEFAULT_DASHSCOPE_BASE_URL, "api_key": "sk-test"}
+ENDPOINT = {"base_url": DEFAULT_DASHSCOPE_BASE_URL, "api_key": "sk-test"}
 
 
 def test_is_model_url_accepts_temporary_oss():

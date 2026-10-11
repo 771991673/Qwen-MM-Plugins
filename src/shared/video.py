@@ -11,7 +11,7 @@ import math
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 
-from shared.env import FFMPEG_TIMEOUT
+from shared.env import ConfigurationError, get_int_env
 from shared.syscmd import find_tool
 
 SEEK_MAX_WORKERS = 16
@@ -60,6 +60,7 @@ def probe_media(path: str) -> dict:
     (video/audio/subtitle/data), and chapters. Returns the parsed ffprobe JSON:
     ``{"format": {...}, "streams": [...], "chapters": [...]}``.
     """
+    timeout = get_int_env("QWEN_MM_FFMPEG_TIMEOUT")
     result = subprocess.run(
         [
             find_tool("ffprobe"),
@@ -74,7 +75,7 @@ def probe_media(path: str) -> dict:
         ],
         capture_output=True,
         text=True,
-        timeout=FFMPEG_TIMEOUT,
+        timeout=timeout,
     )
     if result.returncode != 0:
         raise RuntimeError(f"ffprobe failed: {result.stderr.strip() or 'unknown error'}")
@@ -94,6 +95,8 @@ def video_duration_exceeds(path: str, max_seconds: float | None) -> bool:
         return False
     try:
         duration = float(probe_media(path).get("format", {}).get("duration") or 0.0)
+    except ConfigurationError:
+        raise
     except Exception:  # noqa: BLE001 — ffprobe missing/unreadable: don't downgrade on uncertainty
         return False
     return duration > max_seconds
@@ -105,6 +108,7 @@ def get_video_info(video_path: str) -> dict:
     swapped on a quarter turn) — ffmpeg autorotates on decode, so that is what a ``-vf`` filter and
     the extracted frames actually see. Use ``probe_media`` / ``media_info`` for the stored geometry.
     """
+    timeout = get_int_env("QWEN_MM_FFMPEG_TIMEOUT")
     result = subprocess.run(
         [
             find_tool("ffprobe"),
@@ -122,7 +126,7 @@ def get_video_info(video_path: str) -> dict:
         ],
         capture_output=True,
         text=True,
-        timeout=FFMPEG_TIMEOUT,
+        timeout=timeout,
     )
     if result.returncode != 0:
         raise RuntimeError(f"ffprobe failed: {result.stderr.strip() or 'unknown error'}")
@@ -212,7 +216,7 @@ def extract_frames_by_seeking(
         if vf:
             cmd += ["-vf", vf]
         cmd += ["-f", "image2pipe", "-vcodec", "mjpeg", "-q:v", str(quality), "pipe:1"]
-        proc = subprocess.run(cmd, capture_output=True, timeout=FFMPEG_TIMEOUT)
+        proc = subprocess.run(cmd, capture_output=True, timeout=get_int_env("QWEN_MM_FFMPEG_TIMEOUT"))
         if proc.returncode == 0 and proc.stdout:
             return (round(ts, 1), base64.b64encode(proc.stdout).decode("ascii"))
         return None
