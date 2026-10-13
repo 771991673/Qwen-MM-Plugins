@@ -1,0 +1,43 @@
+---
+description: Keep visual and audio work on local Unsloth; never send media or task data to cloud APIs.
+alwaysApply: true
+---
+
+# Local-only inference (no cloud APIs)
+
+Do not call cloud model, search, storage, or upload APIs for this workspace. That includes DashScope, OpenRouter, OrcaRouter, Cheaper Inference, MiniMax, Serper/Tavily/Exa/Serply, `WebSearch`, `WebFetch`, `GenerateImage`, hosted `qwen-mm-plugins-api` (vision_chat, OCR, grounding, Omni, `transcribe_audio` without a local server), and any other remote endpoint that would receive local files or conversation content.
+
+Keep `QWEN_MM_NATIVE_MODE=1`. Core MCP (`read_image`, `read_video`, `visualize`, `media_info`, crop/draw) may run locally. Do not use caption fallback (`NATIVE_MODE=0`), which uploads images.
+
+## Visual tasks
+
+Use the local Unsloth OpenAI-compatible server (do not send pixels to a hosted VL API):
+
+```bash
+unsloth run \
+  --model unsloth/Qwen3-VL-2B-Instruct-GGUF:UD-Q2_K_XL \
+  --disable-tools \
+  --reasoning off \
+  --api-only \
+  -H 127.0.0.1 \
+  -p 8888
+```
+
+Bind **127.0.0.1** only. `-H 0.0.0.0` makes Unsloth report the port as reachable from the public internet. `--api-only` keeps the Studio UI from unloading this GGUF.
+
+Client: `http://127.0.0.1:8888/v1` (`/v1/chat/completions`). Model id: `unsloth/Qwen3-VL-2B-Instruct-GGUF`. Quant: `Qwen3-VL-2B-Instruct-UD-Q2_K_XL.gguf`. `--disable-tools` must stay on so the server cannot web-search. Auth: local `DASHSCOPE_API_KEY` in `~/.qwen-mm-plugins/config` (Unsloth `sk-unsloth-…` key, never a cloud key).
+
+## Audio tasks
+
+Use local Unsloth `unsloth/Qwen3-0.6B-GGUF` 4-bit (default port **8889** so it does not collide with vision):
+
+```bash
+unsloth run \
+  --model unsloth/Qwen3-0.6B-GGUF:UD-Q4_K_XL \
+  --disable-tools \
+  --reasoning off \
+  -H 127.0.0.1 \
+  -p 8889
+```
+
+Client: `http://127.0.0.1:8889/v1`. Do not use DashScope ASR. If a server is down, start the matching `unsloth run` command locally; do not fail over to a hosted API.
