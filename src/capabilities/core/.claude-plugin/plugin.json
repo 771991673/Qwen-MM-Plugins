@@ -9,8 +9,9 @@
     "qwen-mm-plugins-core": {
       "command": "uvx",
       "args": [
+        "--refresh",
         "--from",
-        "qwen-mm-plugins[core] @ git+https://github.com/QwenLM/Qwen-MM-Plugins.git@qwen-mm-plugins-core-v1.2.0",
+        "qwen-mm-plugins[core] @ file:///Volumes/ExternalNvme/Qwen-MM-Plugins",
         "qwen-mm-plugins-core"
       ]
     }
